@@ -1,0 +1,37 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install celery and redis first
+RUN pip install --no-cache-dir celery==5.3.6 redis==5.0.4
+
+# Install flower separately (without strict version to avoid dependency issues)
+RUN pip install --no-cache-dir flower
+
+# Install web framework
+RUN pip install --no-cache-dir fastapi==0.111.0 uvicorn[standard]==0.29.0
+
+# Install remaining dependencies
+RUN pip install --no-cache-dir \
+    sqlalchemy==2.0.30 \
+    psycopg2-binary==2.9.9 \
+    alembic==1.13.1 \
+    boto3==1.34.101 \
+    docker==7.1.0 \
+    detect-secrets==1.4.0 \
+    python-magic==0.4.27 \
+    httpx==0.27.0 \
+    pydantic-settings==2.2.1 \
+    python-dotenv==1.0.1 \
+    tenacity==8.3.0 \
+    structlog==24.1.0
+
+COPY . .
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
