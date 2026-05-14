@@ -96,10 +96,10 @@ LEVEL_SPECS: dict[int, dict] = {
             {
                 "test_id":     "l1_ws_t001",
                 "description": "Indian politics — current Tamil Nadu CM and party",
-                "input":       "Who is the current Chief Minister of Tamil Nadu and which party do they represent?",
+                "input":       "who is the current health minister of bihar? ",
                 "expected_keywords": [
-                    "stalin", "mk", "dmk", "dravida",
-                    "chief minister", "tamil", "party",
+                    "nitish", "kumar", "jdu", "nishant",
+                    "health minister", "bihar", "party",
                     "government", "minister",
                 ],
                 "match_type":          "any",
