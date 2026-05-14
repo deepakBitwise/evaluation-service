@@ -46,6 +46,9 @@ def run_tier1_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
       zip_storage_key   : str   ← object-store key of uploaded ZIP
       agent_type        : str   ← "standard" | "web_search" (default: "standard")
       rubric_version    : str
+      judge_model       : str
+      judge_temperature : float
+      tier2_webhook_url : str
     """
     submission_id  = payload["submission_id"]
     assessment_id  = payload["assessment_id"]
@@ -167,13 +170,18 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
     # Select test cases based on agent_type declared in the payload
     sandbox_result = None
     if spec.get("sandbox_enabled", False):
-        test_cases = _select_test_cases(spec, agent_type)
         log.info("check_start", check="sandbox_execution",
-                 agent_type=agent_type, test_count=len(test_cases))
+                 agent_type=agent_type,
+                 standard_tests=len(spec.get("test_cases_standard", [])),
+                 web_search_tests=len(spec.get("test_cases_web_search", [])))
 
         sandbox_result = Level1SandboxExecutor().execute(
             extracted_contents=extracted,
-            test_cases=test_cases,
+            test_cases_standard=spec.get("test_cases_standard", []),
+            test_cases_web_search=spec.get("test_cases_web_search", []),
+            agent_type=agent_type,
+            suite_weights=spec.get("sandbox_suite_weights",
+                                   {"standard": 0.40, "web_search": 0.60}),
         )
         check_results.append(sandbox_result)
 
@@ -275,16 +283,6 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _select_test_cases(spec: dict, agent_type: str) -> list[dict]:
-    """
-    Return the correct test case list based on agent_type.
-    "web_search" → test_cases_web_search
-    "standard"   → test_cases_standard (default)
-    """
-    if agent_type == "web_search":
-        return spec.get("test_cases_web_search", spec.get("test_cases_standard", []))
-    return spec.get("test_cases_standard", [])
 
 
 def _build_tier2_scenario(spec: dict, agent_type: str) -> str:

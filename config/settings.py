@@ -1,5 +1,4 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache
 
 
 class Settings(BaseSettings):
@@ -36,11 +35,12 @@ class Settings(BaseSettings):
     tier2_dify_token:  str = ""
 
     # Sandbox (Docker)
-    sandbox_image:           str = "python:3.11-slim"
-    sandbox_timeout_seconds: int = 300
+    sandbox_image:           str = "tier1-sandbox:latest"
+    sandbox_timeout_seconds: int = 900
     sandbox_memory_limit:    int = 536_870_912
     sandbox_cpu_quota:       int = 50_000
     sandbox_working_dir:     str = "/workspace"
+    sandbox_pip_timeout:     int = 120
 
     # Checks
     max_file_size_mb:    int  = 50
@@ -63,6 +63,5 @@ class Settings(BaseSettings):
     platform_mistral_api_key:   str = ""
 
 
-@lru_cache
 def get_settings() -> Settings:
     return Settings()

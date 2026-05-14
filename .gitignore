@@ -9,3 +9,4 @@ htmlcov
 .env
 assessment_backend.egg-info
 uv.lock
+uv.lock.env
