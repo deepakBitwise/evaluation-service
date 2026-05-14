@@ -95,7 +95,7 @@ LEVEL_SPECS: dict[int, dict] = {
         "test_cases_web_search": [
             {
                 "test_id":     "l1_ws_t001",
-                "description": "Indian politics — current Tamil Nadu CM and party",
+                "description": "Indian politics — current Bihar health minister and party",
                 "input":       "who is the current health minister of bihar? ",
                 "expected_keywords": [
                     "nitish", "kumar", "jdu", "nishant",
