@@ -1,7 +1,9 @@
 from __future__ import annotations
+import copy
 import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -26,6 +28,28 @@ configure_logging()
 log = get_logger(__name__)
 
 
+# ── Event status helper ──────────────────────────────────────────────────────
+
+def _send_status_event(submission_id: str, event_type: str, value: str) -> None:
+    settings = get_settings()
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                f"{settings.assessment_api_base_url}/api/v1/submission/{submission_id}/events",
+                json={"type": event_type, "value": value},
+                headers={
+                    "Authorization": f"Bearer {settings.assessment_service_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            log.info("status_event_sent", submission_id=submission_id,
+                     event_type=event_type, value=value)
+    except Exception as exc:
+        log.warning("status_event_failed", submission_id=submission_id,
+                    event_type=event_type, error=str(exc))
+
+
 # ── Main Celery task ─────────────────────────────────────────────────────────
 
 @celery_app.task(
@@ -35,21 +59,6 @@ log = get_logger(__name__)
     default_retry_delay=30,
 )
 def run_tier1_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Level-aware Tier 1 orchestrator.
-
-    Expected payload keys:
-      submission_id     : str
-      assessment_id     : str
-      level             : int
-      attempt_number    : int
-      zip_storage_key   : str   ← object-store key of uploaded ZIP
-      agent_type        : str   ← "standard" | "web_search" (default: "standard")
-      rubric_version    : str
-      judge_model       : str
-      judge_temperature : float
-      tier2_webhook_url : str
-    """
     submission_id  = payload["submission_id"]
     assessment_id  = payload["assessment_id"]
     attempt_number = int(payload.get("attempt_number", 1))
@@ -75,25 +84,6 @@ def run_tier1_checks(self, payload: dict[str, Any]) -> dict[str, Any]:
 # ── Level 1 pipeline ─────────────────────────────────────────────────────────
 
 def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
-    """
-    Full Tier 1 pipeline for Level 1 ZIP-only submissions.
-
-    Steps:
-      1.  Fetch ZIP bytes
-      2.  ZIP extraction + security
-      3.  Required files check
-      4.  .env structure validation
-      5.  Secret scanning
-      6.  agent.py syntax check
-      7.  Sandbox execution (keyword matching)
-      8.  Harness pass-rate gate
-      9.  Advisory checks
-      10. Upload extracted files
-      11. Upload sandbox output
-      12. Assemble tier1_results
-      13. Write to DB
-      14. Trigger Tier 2
-    """
     submission_id  = payload["submission_id"]
     assessment_id  = payload["assessment_id"]
     attempt_number = int(payload.get("attempt_number", 1))
@@ -167,7 +157,6 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
                        check_results, syntax_result.detail)
 
     # ── 7. Sandbox execution ─────────────────────────────────────────
-    # Select test cases based on agent_type declared in the payload
     sandbox_result = None
     if spec.get("sandbox_enabled", False):
         log.info("check_start", check="sandbox_execution",
@@ -186,9 +175,9 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
         check_results.append(sandbox_result)
 
         if sandbox_result.status == CheckStatus.ERROR:
-            # Docker issues → advisory, do not hard-reject
             log.warning("sandbox_error", submission_id=submission_id,
                         detail=sandbox_result.detail)
+            _send_status_event(submission_id, "WARNING", "Code quality is weak")
         elif sandbox_result.failed:
             return _reject(submission_id, assessment_id, attempt_number,
                            check_results, sandbox_result.detail)
@@ -205,7 +194,6 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
                 return _reject(submission_id, assessment_id, attempt_number,
                                check_results, harness_result.detail)
 
-            # Upload sandbox output JSON
             if sandbox_result.metadata:
                 key = f"sandbox_outputs/{submission_id}/output.json"
                 sandbox_output_url = upload_json(
@@ -262,34 +250,47 @@ def _run_zip_only(payload: dict[str, Any], spec: dict) -> dict[str, Any]:
     _write_to_db(submission_id, tier1_results)
 
     # ── 14. Trigger Tier 2 ────────────────────────────────────────────
+    #
+    # Three transformations before sending to DIFY:
+    #
+    # A) _slim_tier1_for_dify  — strips extracted_contents from check
+    #    metadata (15-20K chars of embedded file text). Already accessible
+    #    via artifact_urls — no information loss.
+    #
+    # B) _fix_urls_for_dify    — rewrites minio:9000 → host.docker.internal:9000
+    #    so DIFY (on Windows host) can reach MinIO. NOTE: DIFY's ssrf_proxy
+    #    container may still block host.docker.internal — see note below.
+    #
+    # C) judge_model + judge_temperature forwarded from payload so the DIFY
+    #    Start node receives the LLM selection for the judge runs.
+    #
+    tier1_results_slim = _slim_tier1_for_dify(tier1_results)
+    dify_artifact_urls = _fix_urls_for_dify(artifact_urls)
+    dify_sandbox_url   = _fix_url_for_dify(sandbox_output_url)
+
     _trigger_tier2({
         "submission_id":       submission_id,
         "assessment_id":       assessment_id,
         "attempt_number":      payload.get("attempt_number", 1),
         "rubric_version":      payload.get("rubric_version", "rubv_001"),
         "level":               level,
-        "agent_type":          agent_type,
         "assessment_scenario": _build_tier2_scenario(spec, agent_type),
         "rubric_dimensions":   json.dumps(spec["rubric_dimensions"]),
         "pass_thresholds":     json.dumps(spec["pass_thresholds"]),
-        "artifact_urls":       json.dumps(artifact_urls),
-        "tier1_results":       json.dumps(tier1_results),
-        "sandbox_output_url":  sandbox_output_url,
+        "artifact_urls":       json.dumps(dify_artifact_urls),
+        "tier1_results":       json.dumps(tier1_results_slim),
+        "sandbox_output_url":  dify_sandbox_url,
     })
 
     log.info("tier1_passed", submission_id=submission_id, level=level,
              agent_type=agent_type)
+    _send_status_event(submission_id, "SUCCESS", "Automated checks passed")
     return tier1_results
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
+# ── General helpers ───────────────────────────────────────────────────────────
 
 def _build_tier2_scenario(spec: dict, agent_type: str) -> str:
-    """
-    Build the assessment scenario string for the Tier 2 judge.
-    Appends the web-search addendum if agent_type is web_search.
-    """
     base = spec.get("assessment_scenario", "")
     if agent_type == "web_search":
         addendum = spec.get("assessment_scenario_web_search_addendum", "")
@@ -334,32 +335,197 @@ def _reject(
         _write_to_db(submission_id, payload)
     except Exception:
         pass
+    _send_status_event(submission_id, "FAILURE", "Automated checks Failed")
     log.info("tier1_rejected", submission_id=submission_id, reason=reason)
     return payload
 
 
+# ── DIFY payload helpers ──────────────────────────────────────────────────────
+
+def _slim_tier1_for_dify(tier1_results: dict[str, Any]) -> dict[str, Any]:
+    """
+    Strip extracted_contents from check metadata before sending to DIFY.
+    Reduces tier1_results from ~18K chars to ~2K chars.
+    File contents are accessible via artifact_urls — no information loss.
+    """
+    slimmed = copy.deepcopy(tier1_results)
+    for check in slimmed.get("checks", []):
+        check.get("metadata", {}).pop("extracted_contents", None)
+    return slimmed
+
+
+def _fix_urls_for_dify(artifact_urls: dict[str, str]) -> dict[str, str]:
+    """
+    Rewrite Docker-internal hostnames to host.docker.internal in all URLs.
+
+    IMPORTANT: DIFY runs docker-ssrf_proxy which may still block
+    host.docker.internal (resolves to a private IP). If Node 3 fails
+    with a connection error, check docker/docker-compose.yaml for
+    SSRF_PROXY_ALLOWED_HOSTS or configure MinIO with a public URL.
+    """
+    return {role: _fix_url_for_dify(url) for role, url in artifact_urls.items()}
+
+
+def _fix_url_for_dify(url: str) -> str:
+    """Replace minio:9000 with host.docker.internal:9000 in a single URL."""
+    if not url:
+        return url
+    return (
+        url
+        .replace("http://minio:9000",  "http://host.docker.internal:9000")
+        .replace("https://minio:9000", "http://host.docker.internal:9000")
+    )
+
+
+# ── DB + DIFY network helpers ─────────────────────────────────────────────────
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def _write_to_db(submission_id: str, payload: dict[str, Any]) -> None:
     settings = get_settings()
-    with httpx.Client(timeout=15) as client:
-        resp = client.post(
-            f"{settings.assessment_api_base_url}"
-            f"/submissions/{submission_id}/tier1_results",
-            json=payload,
-            headers={"Authorization": f"Bearer {settings.assessment_service_token}"},
-        )
-        resp.raise_for_status()
+    result_paths = (
+        f"/api/v1/submissions/{submission_id}/tier1_results",
+        f"/submissions/{submission_id}/tier1_results",
+    )
+    try:
+        with httpx.Client(timeout=15) as client:
+            for path in result_paths:
+                resp = client.post(
+                    f"{settings.assessment_api_base_url}{path}",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {settings.assessment_service_token}"},
+                )
+                if resp.status_code == 404:
+                    log.warning("tier1_results_route_not_found",
+                                submission_id=submission_id, path=path)
+                    continue
+                resp.raise_for_status()
+                return
+
+            status = _tier1_status_for_assessment_api(payload)
+            if status:
+                resp = client.patch(
+                    f"{settings.assessment_api_base_url}/api/v1/submissions/{submission_id}/status",
+                    json={"automated_check": status},
+                    headers={"Authorization": f"Bearer {settings.assessment_service_token}"},
+                )
+                resp.raise_for_status()
+                log.info("submission_status_updated",
+                         submission_id=submission_id, automated_check=status)
+                return
+
+            log.warning("tier1_results_not_persisted",
+                        submission_id=submission_id,
+                        reason="no supported status mapping")
+    except Exception as exc:
+        log.warning("tier1_results_not_persisted",
+                    submission_id=submission_id, error=str(exc))
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
 def _trigger_tier2(payload: dict[str, Any]) -> None:
     settings = get_settings()
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(
-            settings.tier2_webhook_url,
-            json={"inputs": payload, "response_mode": "async"},
-            headers={"Authorization": f"Bearer {settings.tier2_dify_token}",
-                     "Content-Type":  "application/json"},
+    timeout  = httpx.Timeout(connect=10, read=300, write=30, pool=30)
+
+    print("\n" + "=" * 20 + " COPY THIS FOR DIFY INPUTS " + "=" * 20)
+    print(json.dumps(payload, indent=2))
+    print("=" * 67 + "\n")
+
+    request_payload = {
+        "inputs":        payload,
+        "response_mode": "streaming",
+        "user":          f"tier1-worker-{payload.get('submission_id', 'unknown')}",
+    }
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream(
+                "POST",
+                settings.tier2_webhook_url,
+                json=request_payload,
+                headers={
+                    "Authorization": f"Bearer {settings.tier2_dify_token}",
+                    "Content-Type":  "application/json",
+                },
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if line.strip():
+                        log.info("tier2_first_event", event_line=line[:200])
+                        break
+
+        log.info(
+            "tier2_triggered",
+            submission_id=payload.get("submission_id"),
+            dify_url=settings.tier2_webhook_url,
+            response_mode="streaming",
         )
-        resp.raise_for_status()
-    log.info("tier2_triggered", submission_id=payload.get("submission_id"))
+        _log_latest_tier2_workflow_run(settings)
+
+    except httpx.ReadTimeout as exc:
+        log.warning(
+            "tier2_trigger_failed",
+            submission_id=payload.get("submission_id"),
+            dify_url=settings.tier2_webhook_url,
+            error=str(exc),
+            note="DIFY may still be running — check DIFY Logs tab",
+        )
+    except httpx.HTTPStatusError as exc:
+        log.warning(
+            "tier2_trigger_failed",
+            submission_id=payload.get("submission_id"),
+            dify_url=settings.tier2_webhook_url,
+            status_code=exc.response.status_code,
+            response_body=exc.response.text[:500],
+            error=str(exc),
+        )
+    except Exception as exc:
+        log.warning(
+            "tier2_trigger_failed",
+            submission_id=payload.get("submission_id"),
+            dify_url=settings.tier2_webhook_url,
+            error=str(exc),
+        )
+
+
+def _log_latest_tier2_workflow_run(settings: Any) -> None:
+    logs_url = _dify_workflow_logs_url(settings.tier2_webhook_url)
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.get(
+                logs_url,
+                headers={"Authorization": f"Bearer {settings.tier2_dify_token}"},
+                params={"page": 1, "limit": 1},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception as exc:
+        log.warning("tier2_logs_fetch_failed",
+                    dify_logs_url=logs_url, error=str(exc))
+        return
+
+    latest       = (body.get("data") or [None])[0]
+    workflow_run = (latest or {}).get("workflow_run") or {}
+    log.info(
+        "tier2_latest_workflow_log",
+        dify_logs_url=logs_url,
+        total=body.get("total"),
+        workflow_run_id=workflow_run.get("id"),
+        status=workflow_run.get("status"),
+        error=workflow_run.get("error"),
+        elapsed_time=workflow_run.get("elapsed_time"),
+        total_steps=workflow_run.get("total_steps"),
+    )
+
+
+def _dify_workflow_logs_url(webhook_url: str) -> str:
+    parsed = urlsplit(webhook_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/v1/workflows/logs", "", ""))
+
+
+def _tier1_status_for_assessment_api(payload: dict[str, Any]) -> str | None:
+    status = payload.get("tier1_status")
+    if status == "passed":
+        return "PASSED"
+    if status == "rejected":
+        return "REJECTED"
+    return None

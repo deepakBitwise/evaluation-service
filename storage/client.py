@@ -14,8 +14,8 @@ def _make_client():
     return boto3.client(
         "s3",
         endpoint_url=s.storage_endpoint_url,
-        aws_access_key_id=s.storage_access_key,
-        aws_secret_access_key=s.storage_secret_key,
+        aws_access_key_id=s.s3_access_key_id,
+        aws_secret_access_key=s.s3_secret_access_key,
         region_name="us-east-1",
     )
 
@@ -113,25 +113,26 @@ def fetch_zip_bytes(zip_key: str) -> bytes:
     else:
         key = zip_key
 
-    log.info("fetch_zip", key=key, bucket=settings.storage_bucket)
+    bucket = _bucket_for_zip_key(key)
+    log.info("fetch_zip", key=key, bucket=bucket)
     
     try:
-        resp = client.get_object(Bucket=settings.storage_bucket, Key=key)
+        resp = client.get_object(Bucket=bucket, Key=key)
         zip_bytes = resp["Body"].read()
         
         # Validate file size
         if len(zip_bytes) > 50 * 1024 * 1024:  # 50 MB limit
-            log.error("zip_file_too_large", key=key, size_mb=len(zip_bytes) / (1024 * 1024))
+            log.error("zip_file_too_large", key=key, bucket=bucket, size_mb=len(zip_bytes) / (1024 * 1024))
             raise ValueError(f"ZIP file exceeds 50 MB limit: {len(zip_bytes)} bytes")
         
-        log.info("zip_fetched_success", key=key, size_bytes=len(zip_bytes))
+        log.info("zip_fetched_success", key=key, bucket=bucket, size_bytes=len(zip_bytes))
         return zip_bytes
         
     except ClientError as exc:
-        log.error("zip_fetch_failed", key=key, error=str(exc), error_code=exc.response.get("Error", {}).get("Code"))
+        log.error("zip_fetch_failed", key=key, bucket=bucket, error=str(exc), error_code=exc.response.get("Error", {}).get("Code"))
         raise
     except Exception as exc:
-        log.error("zip_fetch_error", key=key, error=str(exc), error_type=type(exc).__name__)
+        log.error("zip_fetch_error", key=key, bucket=bucket, error=str(exc), error_type=type(exc).__name__)
         raise
 
 
@@ -280,6 +281,13 @@ def _get_content_type(filename: str) -> str:
     ext = filename.lower()[filename.rfind("."):] if "." in filename else ""
     
     return extension_to_type.get(ext, "application/octet-stream")
+
+
+def _bucket_for_zip_key(key: str) -> str:
+    settings = get_settings()
+    if key.startswith("assessments/"):
+        return settings.assessment_storage_bucket
+    return settings.storage_bucket
 
 
 def _extract_key_from_url(url: str) -> str:

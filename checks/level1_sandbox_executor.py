@@ -222,13 +222,10 @@ class Level1SandboxExecutor(BaseCheck):
             for tc in test_cases_web_search
         ]
 
-        # Decide which suites to run
-        if agent_type == "web_search":
-            all_test_cases = tagged_standard + tagged_web
-            scoring_mode   = "weighted"
-        else:
-            all_test_cases = tagged_standard
-            scoring_mode   = "simple"
+        # Always run both suites. Standard agents still need to demonstrate how
+        # they behave when asked for fresh, source-backed information.
+        all_test_cases = tagged_standard + tagged_web
+        scoring_mode = "weighted" if tagged_web else "simple"
 
         if not all_test_cases:
             return CheckResult(
@@ -425,9 +422,9 @@ class Level1SandboxExecutor(BaseCheck):
             report["pass_rate"]    = weighted
 
         else:
-            # Simple mode — standard suite only
+            # Simple mode — standard suite only, used when no web-search suite exists.
             total  = len(standard_results) or len(results)
-            passed = sum(1 for r in results if r["passed"])
+            passed = sum(1 for r in standard_results or results if r["passed"])
             report["tests_total"]  = total
             report["tests_passed"] = passed
             report["pass_rate"]    = round(passed / total, 4) if total else 0.0

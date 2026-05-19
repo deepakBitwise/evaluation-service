@@ -37,7 +37,7 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/jobs/tier1", status_code=202, dependencies=[Depends(verify_token)])
+@app.post("/jobs/tier1", status_code=202)
 def enqueue_tier1_job(job: SubmissionJob) -> dict[str, str]:
     """
     Enqueues a Level 1 submission for async Tier 1 evaluation.
